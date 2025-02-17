@@ -1,7 +1,7 @@
 {
   "default_upload_delta": "P1D",
   "default_upload_time": "06:00",
-  "check_interval": "PT1H",
+  "check_interval": "PT5M",
   "unprocessed_dir_fp": "unprocessed",
   "processed_dir_fp": "processed"
 }

@@ -1,5 +1,6 @@
 import os
 import time
+import pytz
 import base64
 import argparse
 import datetime as dt
@@ -11,6 +12,10 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 
 CONFIG_FP = "config.json"
+TZ = pytz.timezone("UTC")
+
+def dt_now() -> dt.datetime:
+    return dt.datetime.now(tz=TZ)
 
 def next_upload_time(last_upload_time: Optional[dt.datetime], upload_time: dt.time, upload_delay: dt.timedelta) -> dt.datetime:
     next_upload = (dt.datetime
@@ -82,6 +87,7 @@ class InstaUpload(BaseModel):
 
 class InstaUploadMeta(BaseModel):
     caption: str
+    loc_place: Optional[str]
     loc_lat: Optional[float]
     loc_long: Optional[float]
     upload_at: Optional[dt.datetime]
@@ -90,6 +96,10 @@ class InstaUploadMeta(BaseModel):
     def from_fp(fp: str) -> "InstaUploadMeta":
         with open(fp, "r") as f:
             return InstaUploadMeta.model_validate_json(f.read())
+        
+    def write_to_fp(self, fp: str):
+        with open(fp, "w") as f:
+            f.write(self.model_dump_json(indent=2))
 
 
 class InstaClient:
@@ -104,12 +114,24 @@ class InstaClient:
     @staticmethod
     def get_env_uname_pwd() -> tuple[str, str]:
         return os.getenv("INSTAGRAM_USERNAME"), base64.b64decode(os.getenv("INSTAGRAM_PASSWORD")).decode()
+    
+    def get_last_post_time(self) -> Optional[dt.datetime]:
+        # need 4 because pinned posts are included and take priority
+        last_posts = self.client.user_medias(self.client.user_id, 4)
+        if len(last_posts) == 0:
+            return None
+        last_posts.sort(key=lambda x: x.taken_at, reverse=True)
+        return last_posts[0].taken_at
 
     def upload_post(self, upload: InstaUpload):
         loc = None
         if upload.meta.loc_lat is not None and upload.meta.loc_long is not None:
             loc = self.client.location_search(upload.meta.loc_lat, upload.meta.loc_long)[0]
             loc = self.client.location_complete(loc)
+        elif upload.meta.loc_place is not None:
+            locs = self.client.fbsearch_places(upload.meta.loc_place)
+            if len(locs) > 0:
+                loc = locs[0]
 
         paths = [Path(os.path.join(self.cfg.unprocessed_dir_fp, str(upload.id), InstaUpload.IM_DIR, im))
                  for im in upload.images]
@@ -136,9 +158,17 @@ def try_upload(cfg: Config) -> Optional[SleepFor]:
         return None
 
     upload = unprocessed[0]
-    if upload.meta.upload_at > dt.datetime.now():
+    if upload.meta.upload_at is None:
+        cli = InstaClient(cfg, *InstaClient.get_env_uname_pwd())
+        last_post_time = cli.get_last_post_time()
+        if last_post_time is None:
+            last_post_time = dt_now() - cfg.default_upload_delta
+        upload.meta.upload_at = last_post_time + cfg.default_upload_delta
+        upload.meta.write_to_fp(os.path.join(cfg.unprocessed_dir_fp, str(upload.id), InstaUpload.META_FP))
+
+    if upload.meta.upload_at > dt_now():
         print("Upload not ready")
-        return upload.meta.upload_at - dt.datetime.now() + dt.timedelta(seconds=1)
+        return upload.meta.upload_at - dt_now() + dt.timedelta(seconds=1)
 
     if not upload.validate_post():
         print("Invalid post. Ensure there is at least one image and a location (or set location to null)")
@@ -190,7 +220,6 @@ if __name__ == "__main__":
 
     assert args.new or args.upload or args.cron, "No action specified"
     assert sum([args.new, args.upload, args.cron]) == 1, "Only one action can be specified"
-
 
     if args.new:
         processed = InstaUpload.load_all_from_parent_dir(cfg.processed_dir_fp)
